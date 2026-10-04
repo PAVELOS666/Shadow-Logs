@@ -42,6 +42,7 @@ import {
     saveDeletedMessage,
     toEpoch
 } from "./db";
+import { openDeletedHistoryModal } from "./DeletedHistoryModal";
 import { openHistoryModal } from "./HistoryModal";
 import { settings } from "./settings";
 import { ShadowAttachment, ShadowMessage, StoredShadowMessage } from "./types";
@@ -77,7 +78,7 @@ export function isLocationLogged(channel: Channel): boolean {
         if (wGuilds.includes(channel.guild_id)) return true;
 
         const guild = GuildStore.getGuild(channel.guild_id);
-        const memberCount = guild?.memberCount ?? GuildMemberCountStore?.getMemberCount(channel.guild_id) ?? 0;
+        const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(channel.guild_id) ?? 0;
         return memberCount <= (memberThreshold || 500);
     } else {
         const bChannels = blacklistedChannels?.split(",").map(s => s.trim()).filter(Boolean) || [];
@@ -85,7 +86,7 @@ export function isLocationLogged(channel: Channel): boolean {
     }
 }
 
-function ShadowLogsEnabledIcon({ height = 20, width = 20 }: { height?: number; width?: number }) {
+function ShadowLogsEnabledIcon({ height = 20, width = 20 }: { height?: number | string; width?: number | string }) {
     return (
         <svg width={width} height={height} viewBox="0 0 24 24" style={{ scale: "1.1" }}>
             <path
@@ -96,7 +97,7 @@ function ShadowLogsEnabledIcon({ height = 20, width = 20 }: { height?: number; w
     );
 }
 
-function ShadowLogsDisabledIcon({ height = 20, width = 20 }: { height?: number; width?: number }) {
+function ShadowLogsDisabledIcon({ height = 20, width = 20 }: { height?: number | string; width?: number | string }) {
     return (
         <svg width={width} height={height} viewBox="0 0 24 24" style={{ scale: "1.1" }}>
             <mask id="shadowlogs-disabled-mask">
@@ -132,7 +133,7 @@ const ShadowLogsChatBarButton: ChatBarButtonFactory = ({ channel, isAnyChat }) =
             const guildId = channel.guild_id;
             let bList = blacklistedGuilds?.split(",").map(s => s.trim()).filter(Boolean) || [];
             let wList = whitelistedGuilds?.split(",").map(s => s.trim()).filter(Boolean) || [];
-            const memberCount = guild?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId) ?? 0;
+            const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId) ?? 0;
             const isLarge = memberCount > (memberThreshold || 500);
 
             if (isLogged) {
@@ -203,6 +204,19 @@ function doesMessageHaveHistory(message: ShadowMessage): boolean {
 }
 
 export function createRawDiscordMessage(item: StoredShadowMessage) {
+    // Zachowaj oryginalny timestamp wysłania wiadomości z unikalnego Snowflake ID
+    let originalTimestamp = item.timestamp;
+    if (item.id) {
+        try {
+            const sfTime = Number((BigInt(item.id) >> 22n) + 1420070400000n);
+            if (!isNaN(sfTime) && sfTime > 1420070400000) {
+                originalTimestamp = sfTime;
+            }
+        } catch {}
+    }
+
+    const isoTimestamp = new Date(originalTimestamp || Date.now()).toISOString();
+
     return {
         id: item.id,
         type: 0,
@@ -231,7 +245,7 @@ export function createRawDiscordMessage(item: StoredShadowMessage) {
         mention_everyone: false,
         pinned: false,
         tts: false,
-        timestamp: new Date(item.timestamp).toISOString(),
+        timestamp: isoTimestamp,
         state: "SENT",
         deleted: true,
         deletedAt: item.deletedAt,
@@ -275,7 +289,16 @@ export function rehydrateChannel(channelId: string): void {
         if (!cache || typeof cache.receiveMessage !== "function") return;
 
         let changed = false;
-        for (const item of list) {
+        const sortedList = [...list].sort((a, b) => {
+            try {
+                const idA = BigInt(a.id);
+                const idB = BigInt(b.id);
+                return idA < idB ? -1 : idA > idB ? 1 : 0;
+            } catch {
+                return 0;
+            }
+        });
+        for (const item of sortedList) {
             if (!cache.has(item.id)) {
                 try {
                     const msg = createDiscordMessage(item);
@@ -367,6 +390,18 @@ const patchUserContextMenu: NavContextMenuPatchCallback = (children, { user }: {
     children.push(
         <Menu.MenuGroup key="shadowlogs-user-group">
             <Menu.MenuItem
+                id="shadowlogs-view-user-history"
+                label="View Deleted Messages"
+                action={() => {
+                    openDeletedHistoryModal({
+                        type: "user",
+                        id: user.id,
+                        name: user.globalName || user.username,
+                        avatar: user.getAvatarURL?.(undefined, 80) || user.avatar
+                    });
+                }}
+            />
+            <Menu.MenuItem
                 id="shadowlogs-toggle-ignore-user"
                 label={isIgnored ? "Shadow Logs: Resume Logging User" : "Shadow Logs: Ignore User (Blacklist)"}
                 action={() => {
@@ -403,7 +438,7 @@ const patchGuildContextMenu: NavContextMenuPatchCallback = (children, { guild }:
     if (!guild) return;
 
     const threshold = settings.store.memberThreshold || 500;
-    const memberCount = guild.memberCount ?? GuildMemberCountStore?.getMemberCount(guild.id) ?? 0;
+    const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(guild.id) ?? 0;
     const isLarge = memberCount > threshold;
 
     const whitelisted = settings.store.whitelistedGuilds?.split(",").map(s => s.trim()).filter(Boolean) || [];
@@ -414,6 +449,18 @@ const patchGuildContextMenu: NavContextMenuPatchCallback = (children, { guild }:
 
     children.push(
         <Menu.MenuGroup key="shadowlogs-guild-group">
+            <Menu.MenuItem
+                id="shadowlogs-view-guild-history"
+                label="Server Deleted Logs"
+                action={() => {
+                    openDeletedHistoryModal({
+                        type: "guild",
+                        id: guild.id,
+                        name: guild.name,
+                        icon: (guild as any)?.getIconURL?.(80) || guild.icon
+                    });
+                }}
+            />
             {isLarge ? (
                 <Menu.MenuItem
                     id="shadowlogs-guild-whitelist"
@@ -587,12 +634,59 @@ export default definePlugin({
                         if (inMemoryDeleted.has(channelId)) {
                             const list = inMemoryDeleted.get(channelId);
                             if (list && list.length > 0) {
+                                const existingIds = new Set<string>();
+                                for (const m of action.messages) {
+                                    if (m?.id) existingIds.add(String(m.id));
+                                }
+
+                                const toInject: any[] = [];
                                 for (const item of list) {
-                                    if (!action.messages.some((m: any) => m.id === item.id)) {
-                                        action.messages.push(createDiscordMessage(item));
+                                    if (item?.id && !existingIds.has(String(item.id))) {
+                                        existingIds.add(String(item.id));
+                                        toInject.push(createDiscordMessage(item));
                                     }
                                 }
-                                action.messages.sort((a: any, b: any) => toEpoch(a.timestamp) - toEpoch(b.timestamp));
+
+                                if (toInject.length > 0) {
+                                    // Sprawdź naturalny kierunek sortowania tablicy przekazanej przez Discorda
+                                    let isAscending = false;
+                                    if (action.messages.length >= 2) {
+                                        try {
+                                            const firstId = BigInt(action.messages[0].id);
+                                            const lastId = BigInt(action.messages[action.messages.length - 1].id);
+                                            isAscending = firstId < lastId;
+                                        } catch {
+                                            isAscending = false;
+                                        }
+                                    }
+
+                                    action.messages.push(...toInject);
+
+                                    // Sortuj ściśle po unikalnym Snowflake ID (BigInt) dopasowując się do naturalnego kierunku
+                                    if (isAscending) {
+                                        // Rosnąco (najstarsze na początku, najnowsze na końcu)
+                                        action.messages.sort((a: any, b: any) => {
+                                            try {
+                                                const idA = BigInt(a.id);
+                                                const idB = BigInt(b.id);
+                                                return idA < idB ? -1 : idA > idB ? 1 : 0;
+                                            } catch {
+                                                return 0;
+                                            }
+                                        });
+                                    } else {
+                                        // Malejąco (najnowsze na początku, najstarsze na końcu - standard API Discorda)
+                                        action.messages.sort((a: any, b: any) => {
+                                            try {
+                                                const idA = BigInt(a.id);
+                                                const idB = BigInt(b.id);
+                                                return idA > idB ? -1 : idA < idB ? 1 : 0;
+                                            } catch {
+                                                return 0;
+                                            }
+                                        });
+                                    }
+                                }
                             }
                         }
                     } catch (e) {
@@ -612,7 +706,16 @@ export default definePlugin({
                     const list = inMemoryDeleted.get(channelId);
                     if (list && list.length > 0) {
                         let changed = false;
-                        for (const item of list) {
+                        const sortedList = [...list].sort((a, b) => {
+                            try {
+                                const idA = BigInt(a.id);
+                                const idB = BigInt(b.id);
+                                return idA < idB ? -1 : idA > idB ? 1 : 0;
+                            } catch {
+                                return 0;
+                            }
+                        });
+                        for (const item of sortedList) {
                             if (!res.has(item.id)) {
                                 try {
                                     const msg = createDiscordMessage(item);
@@ -769,7 +872,8 @@ export default definePlugin({
                         authorName: author.global_name || author.username || "User",
                         authorAvatar: author.avatar,
                         content: msg.content ?? "",
-                        timestamp: toEpoch(msg.timestamp),
+                        // Zachowaj oryginalny timestamp wysłania (nie data usunięcia)
+                        timestamp: toEpoch(msg.timestamp, msg.id),
                         deleted: true,
                         deletedAt: now,
                         attachments: msg.attachments?.map((a: any) => ({
@@ -862,7 +966,7 @@ export default definePlugin({
                 const wGuilds = whitelistedGuilds?.split(",").map(s => s.trim()).filter(Boolean) || [];
                 if (!wGuilds.includes(guildId)) {
                     const guild = GuildStore.getGuild(guildId);
-                    const memberCount = guild?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId) ?? 0;
+                    const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId) ?? 0;
                     if (memberCount > (memberThreshold || 500)) {
                         return true;
                     }

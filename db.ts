@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Shadow Logs - Persistent Message Logger for Vencord
  * Database Layer using Vencord Native DataStore API
  */
@@ -9,19 +9,29 @@ import { DBStats, StoredShadowMessage } from "./types";
 
 const shadowStore = DataStore.createStore("ShadowLogsDataStore", "shadowMessages");
 
-export function toEpoch(ts: any): number {
-    if (!ts) return Date.now();
-    if (typeof ts === "number" && !isNaN(ts)) return ts;
-    if (typeof ts.toDate === "function") {
-        const d = ts.toDate();
-        if (d instanceof Date && !isNaN(d.getTime())) return d.getTime();
+export function toEpoch(ts: any, snowflakeIdFallback?: string): number {
+    if (ts) {
+        if (typeof ts === "number" && !isNaN(ts)) return ts;
+        if (typeof ts.toDate === "function") {
+            const d = ts.toDate();
+            if (d instanceof Date && !isNaN(d.getTime())) return d.getTime();
+        }
+        if (typeof ts.valueOf === "function") {
+            const v = ts.valueOf();
+            if (typeof v === "number" && !isNaN(v)) return v;
+        }
+        const parsed = new Date(ts).getTime();
+        if (!isNaN(parsed)) return parsed;
     }
-    if (typeof ts.valueOf === "function") {
-        const v = ts.valueOf();
-        if (typeof v === "number" && !isNaN(v)) return v;
+
+    if (snowflakeIdFallback) {
+        try {
+            const sf = Number((BigInt(snowflakeIdFallback) >> 22n) + 1420070400000n);
+            if (!isNaN(sf) && sf > 1420070400000) return sf;
+        } catch {}
     }
-    const parsed = new Date(ts).getTime();
-    return isNaN(parsed) ? Date.now() : parsed;
+
+    return Date.now();
 }
 
 export async function saveDeletedMessage(msg: StoredShadowMessage): Promise<void> {
@@ -34,7 +44,7 @@ export async function saveDeletedMessage(msg: StoredShadowMessage): Promise<void
             authorName: msg.authorName || "User",
             authorAvatar: msg.authorAvatar,
             content: String(msg.content ?? ""),
-            timestamp: toEpoch(msg.timestamp),
+            timestamp: toEpoch(msg.timestamp, msg.id),
             deleted: true,
             deletedAt: toEpoch(msg.deletedAt || Date.now()),
             attachments: (msg.attachments || []).map(a => ({
@@ -131,7 +141,9 @@ export async function getAllDeleted(): Promise<StoredShadowMessage[]> {
     try {
         const all = await DataStore.values<StoredShadowMessage>(shadowStore);
         if (!all || !Array.isArray(all)) return [];
-        return all.filter(m => m && m.id && m.deleted);
+        return all
+            .filter(m => m && m.id && m.deleted)
+            .sort((a, b) => toEpoch(b.deletedAt || b.timestamp) - toEpoch(a.deletedAt || a.timestamp));
     } catch (e) {
         console.error("[ShadowLogs] Error fetching all deleted:", e);
         return [];
@@ -141,9 +153,35 @@ export async function getAllDeleted(): Promise<StoredShadowMessage[]> {
 export async function getDeletedMessagesForChannel(channelId: string): Promise<StoredShadowMessage[]> {
     try {
         const all = await getAllDeleted();
-        return all.filter(m => m.channelId === channelId);
+        return all
+            .filter(m => m.channelId === channelId)
+            .sort((a, b) => toEpoch(b.deletedAt || b.timestamp) - toEpoch(a.deletedAt || a.timestamp));
     } catch (e) {
         console.error("[ShadowLogs] Error fetching deleted messages for channel:", e);
+        return [];
+    }
+}
+
+export async function getDeletedMessagesForAuthor(authorId: string): Promise<StoredShadowMessage[]> {
+    try {
+        const all = await getAllDeleted();
+        return all
+            .filter(m => m.authorId === authorId)
+            .sort((a, b) => toEpoch(b.deletedAt || b.timestamp) - toEpoch(a.deletedAt || a.timestamp));
+    } catch (e) {
+        console.error("[ShadowLogs] Error fetching deleted messages for author:", e);
+        return [];
+    }
+}
+
+export async function getDeletedMessagesForGuild(guildId: string): Promise<StoredShadowMessage[]> {
+    try {
+        const all = await getAllDeleted();
+        return all
+            .filter(m => m.guildId === guildId)
+            .sort((a, b) => toEpoch(b.deletedAt || b.timestamp) - toEpoch(a.deletedAt || a.timestamp));
+    } catch (e) {
+        console.error("[ShadowLogs] Error fetching deleted messages for guild:", e);
         return [];
     }
 }

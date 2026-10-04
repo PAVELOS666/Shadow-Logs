@@ -142,3 +142,303 @@
     display: flex;
     align-items: center;
 }
+
+/* History Modal Styles */
+.shadowlogs-history-container {
+    display: flex;
+    flex-direction: column;
+    height: 600px;
+    max-height: 80vh;
+    overflow: hidden;
+}
+
+.shadowlogs-history-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+    margin-bottom: 12px;
+}
+
+.shadowlogs-history-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.shadowlogs-history-stat-badge {
+    background: rgba(242, 63, 67, 0.15);
+    color: var(--text-danger, #f23f43);
+    border: 1px solid rgba(242, 63, 67, 0.3);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+}
+
+.shadowlogs-history-match-badge {
+    background: rgba(88, 101, 242, 0.15);
+    color: var(--brand-experiment, #5865f2);
+    border: 1px solid rgba(88, 101, 242, 0.3);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+}
+
+.shadowlogs-history-search-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    width: 100%;
+}
+
+.shadowlogs-history-search-input {
+    width: 100%;
+    padding-right: 32px;
+}
+
+.shadowlogs-history-clear-btn {
+    position: absolute;
+    right: 8px;
+    background: none;
+    border: none;
+    color: var(--text-muted, #949ba4);
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 4px;
+    border-radius: 4px;
+    line-height: 1;
+}
+
+.shadowlogs-history-clear-btn:hover {
+    color: var(--text-normal, #dbdee1);
+}
+
+.shadowlogs-history-list {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.shadowlogs-history-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted, #949ba4);
+    font-size: 0.95rem;
+    gap: 12px;
+    padding: 40px 0;
+}
+
+.shadowlogs-spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(242, 63, 67, 0.2);
+    border-top-color: var(--text-danger, #f23f43);
+    border-radius: 50%;
+    animation: shadowlogs-spin 0.8s linear infinite;
+}
+
+@keyframes shadowlogs-spin {
+    to { transform: rotate(360deg); }
+}
+
+.shadowlogs-history-card {
+    background: var(--background-secondary, #2b2d31);
+    border: 1px solid var(--background-tertiary, #1e1f22);
+    border-left: 3.5px solid var(--text-danger, #f23f43);
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: background 0.15s ease;
+}
+
+.shadowlogs-history-card:hover {
+    background: var(--background-secondary-alt, #232428);
+}
+
+.shadowlogs-history-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.shadowlogs-history-card-author-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.shadowlogs-history-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+}
+
+.shadowlogs-history-card-names {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.shadowlogs-history-author-name {
+    font-weight: 600;
+    color: var(--header-primary, #f2f3f5);
+    font-size: 0.92rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.shadowlogs-history-channel-badge {
+    background: var(--background-tertiary, #1e1f22);
+    color: var(--text-muted, #949ba4);
+    font-size: 0.75rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.shadowlogs-history-card-actions {
+    flex-shrink: 0;
+}
+
+.shadowlogs-history-jump-button {
+    font-size: 0.75rem !important;
+    padding: 2px 8px !important;
+    height: 26px !important;
+    min-height: 26px !important;
+}
+
+.shadowlogs-history-timestamps {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.75rem;
+    color: var(--text-muted, #949ba4);
+    flex-wrap: wrap;
+}
+
+.shadowlogs-history-time-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.shadowlogs-deleted-time-badge {
+    color: var(--text-danger, #f23f43);
+    font-weight: 600;
+}
+
+.shadowlogs-history-edits-badge {
+    background: rgba(235, 168, 62, 0.15);
+    color: #f0b232;
+    border: 1px solid rgba(235, 168, 62, 0.3);
+    padding: 1px 5px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.72rem;
+    font-weight: 600;
+}
+
+.shadowlogs-history-edits-badge:hover {
+    background: rgba(235, 168, 62, 0.25);
+}
+
+.shadowlogs-history-content {
+    color: var(--text-normal, #dbdee1);
+    font-size: 0.9rem;
+    line-height: 1.35;
+    word-break: break-word;
+    user-select: text;
+    margin-top: 2px;
+}
+
+.shadowlogs-history-no-content {
+    color: var(--text-muted, #949ba4);
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
+.shadowlogs-history-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.shadowlogs-history-attachment-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.shadowlogs-history-attachment-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 220px;
+}
+
+.shadowlogs-history-thumb {
+    max-width: 200px;
+    max-height: 140px;
+    border-radius: 4px;
+    object-fit: cover;
+}
+
+.shadowlogs-history-attachment-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--background-tertiary, #1e1f22);
+    border: 1px solid rgba(242, 63, 67, 0.3);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 0.8rem;
+}
+
+.shadowlogs-history-attachment-link {
+    color: var(--text-link, #00a8fc);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.shadowlogs-history-attachment-link:hover {
+    text-decoration: underline;
+}
+
+.shadowlogs-history-file-size {
+    color: var(--text-muted, #949ba4);
+    font-size: 0.75rem;
+}
+
+.shadowlogs-history-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding-top: 10px;
+    border-top: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+    margin-top: 8px;
+}
+
+.shadowlogs-history-page-info {
+    font-size: 0.85rem;
+    color: var(--text-normal, #dbdee1);
+    font-weight: 500;
+}

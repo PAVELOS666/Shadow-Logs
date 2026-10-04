@@ -1,0 +1,144 @@
+/*
+ * Shadow Logs - Styling
+ */
+
+.shadowlogs-deleted {
+    background-color: rgba(242, 63, 67, 0.12) !important;
+    border-left: 3.5px solid var(--text-danger, #f23f43) !important;
+    padding-left: 8px !important;
+    transition: background-color 0.2s ease;
+}
+
+.shadowlogs-deleted:hover {
+    background-color: rgba(242, 63, 67, 0.18) !important;
+}
+
+.shadowlogs-deleted-badge {
+    display: inline-flex;
+    align-items: center;
+    background-color: rgba(242, 63, 67, 0.18);
+    color: var(--text-danger, #f23f43);
+    border: 1px solid rgba(242, 63, 67, 0.35);
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.2;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    user-select: none;
+    vertical-align: middle;
+}
+
+.shadowlogs-deleted-attachment {
+    opacity: 0.55;
+    filter: grayscale(70%);
+    border: 1.5px dashed var(--text-danger, #f23f43) !important;
+    border-radius: 6px;
+    position: relative;
+}
+
+.shadowlogs-deleted-attachment::after {
+    content: "DELETED";
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: rgba(242, 63, 67, 0.85);
+    color: #fff;
+    font-size: 0.65rem;
+    font-weight: bold;
+    padding: 2px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    pointer-events: none;
+}
+
+.shadowlogs-edit-marker {
+    cursor: pointer;
+    text-decoration: underline dotted;
+    color: var(--text-muted);
+}
+
+.shadowlogs-edit-marker:hover {
+    color: var(--text-normal);
+}
+
+/* Settings Prune Box */
+.shadowlogs-settings-card {
+    background: var(--background-secondary-alt, #232428);
+    border: 1px solid var(--background-tertiary, #1e1f22);
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 12px;
+    margin-bottom: 16px;
+}
+
+.shadowlogs-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.shadowlogs-stat-box {
+    background: var(--background-primary, #313338);
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+}
+
+.shadowlogs-stat-label {
+    font-size: 0.75rem;
+    color: var(--text-muted, #949ba4);
+    text-transform: uppercase;
+    font-weight: 600;
+}
+
+.shadowlogs-stat-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--header-primary, #f2f3f5);
+    margin-top: 2px;
+}
+
+.shadowlogs-prune-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+
+.shadowlogs-input {
+    background: var(--input-background, #1e1f22);
+    color: var(--text-normal, #dbdee1);
+    border: 1px solid var(--background-tertiary, #1e1f22);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 0.9rem;
+    outline: none;
+    min-width: 90px;
+}
+
+.shadowlogs-input:focus {
+    border-color: var(--brand-experiment, #5865f2);
+}
+
+.shadowlogs-select {
+    background: var(--input-background, #1e1f22);
+    color: var(--text-normal, #dbdee1);
+    border: 1px solid var(--background-tertiary, #1e1f22);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 0.9rem;
+    outline: none;
+    cursor: pointer;
+}
+
+.shadowlogs-notice {
+    font-size: 0.85rem;
+    color: var(--text-positive, #23a55a);
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+}

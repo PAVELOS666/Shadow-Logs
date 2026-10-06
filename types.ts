@@ -25,9 +25,12 @@ export interface StoredShadowMessage {
     id: string;
     channelId: string;
     guildId?: string;
+    channel_id?: string;
+    guild_id?: string;
     authorId: string;
     authorName?: string;
     authorAvatar?: string;
+    author?: any;
     content: string;
     timestamp: number; // epoch ms
     deleted: boolean;
@@ -42,6 +45,9 @@ export interface StoredShadowMessage {
         content_type?: string;
         deleted?: boolean;
     }[];
+    embeds?: any[];
+    message_reference?: any;
+    sticker_items?: any[];
 }
 
 export type TimeUnit = "seconds" | "minutes" | "hours" | "days" | "months";
@@ -49,5 +55,6 @@ export type TimeUnit = "seconds" | "minutes" | "hours" | "days" | "months";
 export interface DBStats {
     count: number;
     deletedCount: number;
+    editedCount?: number;
     estimatedSizeBytes: number;
 }

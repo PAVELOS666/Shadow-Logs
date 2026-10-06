@@ -192,6 +192,12 @@ export function RetentionComponent() {
                     </span>
                 </div>
                 <div className="shadowlogs-stat-box">
+                    <span className="shadowlogs-stat-label">Edited Messages</span>
+                    <span className="shadowlogs-stat-value" style={{ color: "var(--text-warning, #f0b232)" }}>
+                        {(stats.editedCount ?? 0).toLocaleString()}
+                    </span>
+                </div>
+                <div className="shadowlogs-stat-box">
                     <span className="shadowlogs-stat-label">Estimated Size</span>
                     <span className="shadowlogs-stat-value">{formatBytes(stats.estimatedSizeBytes)}</span>
                 </div>

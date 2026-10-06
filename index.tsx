@@ -40,7 +40,10 @@ import {
     getAllDeleted,
     markDeleted,
     saveDeletedMessage,
-    toEpoch
+    saveMessagesBatch,
+    saveNewMessage,
+    toEpoch,
+    toRawStoredMessage
 } from "./db";
 import { openDeletedHistoryModal } from "./DeletedHistoryModal";
 import { openHistoryModal } from "./HistoryModal";
@@ -78,8 +81,12 @@ export function isLocationLogged(channel: Channel): boolean {
         if (wGuilds.includes(channel.guild_id)) return true;
 
         const guild = GuildStore.getGuild(channel.guild_id);
-        const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(channel.guild_id) ?? 0;
-        return memberCount <= (memberThreshold || 500);
+        const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(channel.guild_id);
+        const threshold = memberThreshold || 500;
+        if (typeof memberCount === "number" && memberCount > 0 && memberCount > threshold) {
+            return false;
+        }
+        return true;
     } else {
         const bChannels = blacklistedChannels?.split(",").map(s => s.trim()).filter(Boolean) || [];
         return !bChannels.includes(channel.id);
@@ -257,66 +264,35 @@ export function createRawDiscordMessage(item: StoredShadowMessage) {
 }
 
 export function createDiscordMessage(item: StoredShadowMessage): any {
-    const raw = createRawDiscordMessage(item);
-    if (typeof createMessageRecord === "function") {
-        try {
-            const rec = createMessageRecord(raw);
-            if (rec) {
-                rec.deleted = true;
-                rec.deletedAt = item.deletedAt;
-                if (item.editHistory?.length) {
-                    rec.editHistory = item.editHistory.map(e => ({
-                        timestamp: new Date(e.timestamp),
-                        content: e.content,
-                    }));
+    try {
+        const raw = createRawDiscordMessage(item);
+        if (typeof createMessageRecord === "function") {
+            try {
+                const rec = createMessageRecord(raw);
+                if (rec) {
+                    rec.deleted = true;
+                    rec.deletedAt = item.deletedAt;
+                    if (item.editHistory?.length) {
+                        rec.editHistory = item.editHistory.map(e => ({
+                            timestamp: new Date(e.timestamp),
+                            content: e.content,
+                        }));
+                    }
+                    return rec;
                 }
-                return rec;
+            } catch (recErr) {
+                console.error("[ShadowLogs] createMessageRecord failed for messageId:", item?.id, recErr);
             }
-        } catch {
-            // fallback to raw
         }
+        return raw;
+    } catch (e) {
+        console.error("[ShadowLogs] Error in createDiscordMessage for messageId:", item?.id, e);
+        return item;
     }
-    return raw;
 }
 
 export function rehydrateChannel(channelId: string): void {
-    if (!channelId || !inMemoryDeleted.has(channelId)) return;
-    const list = inMemoryDeleted.get(channelId);
-    if (!list || list.length === 0) return;
-
-    try {
-        let cache = MessageCache.getOrCreate(channelId);
-        if (!cache || typeof cache.receiveMessage !== "function") return;
-
-        let changed = false;
-        const sortedList = [...list].sort((a, b) => {
-            try {
-                const idA = BigInt(a.id);
-                const idB = BigInt(b.id);
-                return idA < idB ? -1 : idA > idB ? 1 : 0;
-            } catch {
-                return 0;
-            }
-        });
-        for (const item of sortedList) {
-            if (!cache.has(item.id)) {
-                try {
-                    const msg = createDiscordMessage(item);
-                    cache = cache.receiveMessage(msg);
-                    changed = true;
-                } catch (err) {
-                    logger.error("Error receiving message in rehydrateChannel:", item.id, err);
-                }
-            }
-        }
-
-        if (changed) {
-            MessageCache.commit(cache);
-            MessageStore.emitChange();
-        }
-    } catch (e) {
-        logger.error("Error rehydrating channel:", channelId, e);
-    }
+    // Usunięto wywołania cache.receiveMessage - wiadomości są bezpiecznie wstrzykiwane jako surowy JSON w LOAD_MESSAGES_SUCCESS
 }
 
 const patchMessageContextMenu: NavContextMenuPatchCallback = (children, { message }: { message: ShadowMessage }) => {
@@ -560,7 +536,9 @@ const patchChannelContextMenu: NavContextMenuPatchCallback = (children, { channe
 };
 
 let originalDispatch: any = null;
-let originalGetMessages: any = null;
+let dbReadyResolve: () => void = () => {};
+let isDbReady = false;
+let dbReadyPromise: Promise<void> = Promise.resolve();
 
 export default definePlugin({
     name: "ShadowLogs",
@@ -589,15 +567,18 @@ export default definePlugin({
     start() {
         this.boundOnMessageCreate = this.onMessageCreate.bind(this);
         this.boundOnMessageUpdate = this.onMessageUpdate.bind(this);
-        this.boundOnChannelSelect = ({ channelId }: { channelId: string }) => {
-            if (channelId) {
-                setTimeout(() => rehydrateChannel(channelId), 30);
-            }
-        };
 
         FluxDispatcher.subscribe("MESSAGE_CREATE", this.boundOnMessageCreate);
         FluxDispatcher.subscribe("MESSAGE_UPDATE", this.boundOnMessageUpdate);
-        FluxDispatcher.subscribe("CHANNEL_SELECT", this.boundOnChannelSelect);
+
+        // Promise gotowości bazy danych do wyeliminowania wyścigu przy starcie
+        isDbReady = false;
+        dbReadyPromise = new Promise<void>(resolve => {
+            dbReadyResolve = () => {
+                isDbReady = true;
+                resolve();
+            };
+        });
 
         // Preload all persistent deleted messages into fast in-memory map
         getAllDeleted().then(all => {
@@ -609,15 +590,50 @@ export default definePlugin({
                 inMemoryDeleted.get(item.channelId)!.push(item);
             }
             logger.info("Loaded " + all.length + " persistent deleted messages into cache.");
+            dbReadyResolve();
 
+            // Jeśli baza załadowała się po pierwotnym wywołaniu, bezpiecznie odśwież aktualny kanał przez Flux
             const currentChannelId = SelectedChannelStore.getChannelId();
-            if (currentChannelId) {
-                rehydrateChannel(currentChannelId);
+            if (currentChannelId && inMemoryDeleted.has(currentChannelId)) {
+                const channelDeleted = inMemoryDeleted.get(currentChannelId);
+                if (channelDeleted && channelDeleted.length > 0) {
+                    const msgs = MessageStore.getMessages(currentChannelId);
+                    if (msgs && msgs._array && msgs._array.length > 0) {
+                        let currentMaxId: bigint | null = null;
+                        for (const m of msgs._array) {
+                            if (m?.id) {
+                                try {
+                                    const bn = BigInt(m.id);
+                                    if (currentMaxId === null || bn > currentMaxId) currentMaxId = bn;
+                                } catch {}
+                            }
+                        }
+                        const hasMissingAtEnd = currentMaxId !== null && channelDeleted.some(d => {
+                            try {
+                                return BigInt(d.id) > currentMaxId! && !msgs.has(d.id);
+                            } catch {
+                                return false;
+                            }
+                        });
+                        if (hasMissingAtEnd) {
+                            FluxDispatcher.dispatch({
+                                type: "LOCAL_MESSAGES_LOADED",
+                                channelId: currentChannelId,
+                                messages: msgs._array.map((m: any) => m),
+                                isPluginDbReady: true,
+                            });
+                        }
+                    }
+                }
             }
+
             MessageStore.emitChange();
         }).catch(err => {
             logger.error("Failed loading persistent logs:", err);
+            dbReadyResolve();
         });
+
+        const pluginSelf = this;
 
         // Intercept LOAD_MESSAGES_SUCCESS directly at Dispatcher level
         if (!originalDispatch && FluxDispatcher?.dispatch) {
@@ -629,42 +645,216 @@ export default definePlugin({
                     action.channelId &&
                     Array.isArray(action.messages)
                 ) {
-                    try {
-                        const channelId = action.channelId;
-                        if (inMemoryDeleted.has(channelId)) {
-                            const list = inMemoryDeleted.get(channelId);
-                            if (list && list.length > 0) {
-                                const existingIds = new Set<string>();
-                                for (const m of action.messages) {
-                                    if (m?.id) existingIds.add(String(m.id));
-                                }
+                    const processAction = () => {
+                        try {
+                            const eventName = action.type;
+                            const channelId = action.channelId;
+                            const inputCount = action.messages.length;
 
-                                const toInject: any[] = [];
+                            // 1. Zaloguj klucze i wartości akcji dla każdego eventu
+                            console.log(
+                                `[ShadowLogs] ${eventName} flags: channelId=${channelId}, isBefore=${action.isBefore}, isAfter=${action.isAfter}, ` +
+                                `hasMoreBefore=${action.hasMoreBefore}, hasMoreAfter=${action.hasMoreAfter}, jump=${typeof action.jump === "object" ? JSON.stringify(action.jump) : action.jump}, ` +
+                                `limit=${action.limit}, truncate=${action.truncate}, ready=${action.ready}`
+                            );
+
+                            // Asynchroniczny batch zapis oryginalnych wiadomości z załadowanej partii do IndexedDB
+                            if (!action.isPluginDbReady) {
+                                const originalMsgs = action.messages.filter((m: any) => m && m.id && !m.deleted);
+                                if (originalMsgs.length > 0) {
+                                    const channel = ChannelStore.getChannel(channelId);
+                                    const toBatchSave: StoredShadowMessage[] = [];
+
+                                    for (const m of originalMsgs) {
+                                        const reason = pluginSelf.getIgnoreReason(m);
+                                        if (reason) {
+                                            console.log(`[ShadowLogs] skipped ${m.id} reason: ${reason}`);
+                                        } else {
+                                            toBatchSave.push(toRawStoredMessage(m, channelId, m.guild_id || channel?.guild_id));
+                                        }
+                                    }
+
+                                    if (toBatchSave.length > 0) {
+                                        (async () => {
+                                            try {
+                                                const savedIds = await saveMessagesBatch(toBatchSave);
+                                                const savedSet = new Set(savedIds);
+                                                for (const item of toBatchSave) {
+                                                    if (savedSet.has(item.id)) {
+                                                        console.log(`[ShadowLogs] saved ${item.id} channel ${item.channelId} guild ${item.guildId || "DM"}`);
+                                                    }
+                                                }
+                                            } catch (err) {
+                                                console.error("[ShadowLogs] Error in batch save during LOAD_MESSAGES_SUCCESS:", err);
+                                            }
+                                        })();
+                                    }
+                                }
+                            }
+
+                            // 6. Sprawdzenie dla emitowanego przez plugin LOCAL_MESSAGES_LOADED (tylko aktualnie otwarty kanał)
+                            if (action.isPluginDbReady && channelId !== SelectedChannelStore.getChannelId()) {
+                                console.log(`[ShadowLogs] ${eventName} pominięto: isPluginDbReady dla nieaktywnego kanału ${channelId}`);
+                                return;
+                            }
+
+                            // Analiza paginacji
+                            const isBefore = !!(action.isBefore || (action as any).before);
+                            const isAfter = !!(action.isAfter || (action as any).after);
+                            const hasJumpTarget = !!(
+                                (typeof action.jump === "object" && action.jump && (action.jump.messageId || action.jump.message_id)) ||
+                                (typeof action.jump === "string" && action.jump) ||
+                                (action as any).messageId ||
+                                (action as any).message_id ||
+                                action.around ||
+                                (action as any).around
+                            );
+                            const hasMoreAfter = !!action.hasMoreAfter;
+                            const hasMoreBefore = action.hasMoreBefore !== undefined ? !!action.hasMoreBefore : false;
+
+                            // 2. Wstrzykuj wiadomości o id > maxId TYLKO gdy partia jest ładowaniem najnowszych wiadomości kanału
+                            // (nie isBefore, nie isAfter, nie jump/around do konkretnego id w historii, i brak hasMoreAfter). Przy isBefore nigdy nie wstrzykuj nowszych niż maxId.
+                            const reachesEnd = !isBefore && !isAfter && !hasJumpTarget && !hasMoreAfter;
+
+                            // 3. Wstrzykuj wiadomości o id < minId TYLKO gdy partia sięga początku historii (brak hasMoreBefore) i nie jest to ładowanie isAfter.
+                            const reachesStart = !hasMoreBefore && !isAfter && !hasJumpTarget;
+
+                            const list = inMemoryDeleted.get(channelId) || [];
+                            const channelDeletedCount = list.length;
+
+                            let minId: bigint | null = null;
+                            let maxId: bigint | null = null;
+                            const existingIds = new Set<string>();
+
+                            for (const m of action.messages) {
+                                if (m?.id) {
+                                    existingIds.add(String(m.id));
+                                    try {
+                                        const idBn = BigInt(m.id);
+                                        if (minId === null || idBn < minId) minId = idBn;
+                                        if (maxId === null || idBn > maxId) maxId = idBn;
+                                    } catch {}
+                                }
+                            }
+
+                            const toInject: { rawMessage: any; id: string; reason: string }[] = [];
+                            const rejectedList: { id: string; reason: string }[] = [];
+
+                            if (channelDeletedCount > 0) {
                                 for (const item of list) {
-                                    if (item?.id && !existingIds.has(String(item.id))) {
+                                    if (!item?.id) continue;
+                                    if (existingIds.has(String(item.id))) {
+                                        rejectedList.push({ id: item.id, reason: "Already present in action.messages" });
+                                        continue;
+                                    }
+
+                                    let inRange = false;
+                                    let injectReason = "";
+                                    let rejectReason = "";
+
+                                    if (minId === null || maxId === null) {
+                                        // Obsługa pustej partii wiadomości
+                                        if (reachesEnd) {
+                                            inRange = true;
+                                            injectReason = "reachesEnd";
+                                        } else if (reachesStart) {
+                                            inRange = true;
+                                            injectReason = "reachesStart";
+                                        } else {
+                                            inRange = false;
+                                            rejectReason = "Empty batch in pagination range";
+                                        }
+                                    } else {
+                                        try {
+                                            const itemBn = BigInt(item.id);
+                                            const isBetween = itemBn >= minId && itemBn <= maxId;
+                                            const isNewer = itemBn > maxId;
+                                            const isOlder = itemBn < minId;
+
+                                            if (action.isPluginDbReady) {
+                                                // 6. Dla emitowanego przez plugin LOCAL_MESSAGES_LOADED: wstrzykuj tylko wiadomości, które powinny być na końcu aktualnie załadowanego okna; nie mieszaj w środek.
+                                                if (isNewer && reachesEnd) {
+                                                    inRange = true;
+                                                    injectReason = "reachesEnd";
+                                                } else {
+                                                    inRange = false;
+                                                    rejectReason = isBetween
+                                                        ? "isPluginDbReady: odrzucono ze środka okna (zakaz mieszania w środek)"
+                                                        : `isPluginDbReady: poza końcem okna [${minId}, ${maxId}]`;
+                                                }
+                                            } else {
+                                                // 4. Standardowy przepływ:
+                                                if (isBetween) {
+                                                    inRange = true;
+                                                    injectReason = "inRange";
+                                                } else if (isNewer && reachesEnd) {
+                                                    inRange = true;
+                                                    injectReason = "reachesEnd";
+                                                } else if (isOlder && reachesStart) {
+                                                    inRange = true;
+                                                    injectReason = "reachesStart";
+                                                } else {
+                                                    inRange = false;
+                                                    if (isNewer) {
+                                                        rejectReason = isBefore
+                                                            ? `Newer than maxId (${item.id} > ${maxId}) during isBefore (przewijanie w górę)`
+                                                            : `Newer than maxId (${item.id} > ${maxId}) and not newest batch`;
+                                                    } else if (isOlder) {
+                                                        rejectReason = `Older than minId (${item.id} < ${minId}) and reachesStart is false`;
+                                                    } else {
+                                                        rejectReason = `Outside range [${minId}, ${maxId}]`;
+                                                    }
+                                                }
+                                            }
+                                        } catch {
+                                            inRange = false;
+                                            rejectReason = "Invalid snowflake ID";
+                                        }
+                                    }
+
+                                    if (inRange) {
                                         existingIds.add(String(item.id));
-                                        toInject.push(createDiscordMessage(item));
+                                        toInject.push({
+                                            rawMessage: createRawDiscordMessage(item),
+                                            id: item.id,
+                                            reason: injectReason,
+                                        });
+                                    } else {
+                                        rejectedList.push({ id: item.id, reason: rejectReason });
                                     }
                                 }
 
                                 if (toInject.length > 0) {
-                                    // Sprawdź naturalny kierunek sortowania tablicy przekazanej przez Discorda
-                                    let isAscending = false;
-                                    if (action.messages.length >= 2) {
-                                        try {
-                                            const firstId = BigInt(action.messages[0].id);
-                                            const lastId = BigInt(action.messages[action.messages.length - 1].id);
-                                            isAscending = firstId < lastId;
-                                        } catch {
-                                            isAscending = false;
+                                    let firstId: bigint | null = null;
+                                    let lastId: bigint | null = null;
+
+                                    for (let i = 0; i < action.messages.length; i++) {
+                                        if (action.messages[i]?.id) {
+                                            try {
+                                                firstId = BigInt(action.messages[i].id);
+                                                break;
+                                            } catch {}
                                         }
                                     }
 
-                                    action.messages.push(...toInject);
+                                    for (let i = action.messages.length - 1; i >= 0; i--) {
+                                        if (action.messages[i]?.id) {
+                                            try {
+                                                const cur = BigInt(action.messages[i].id);
+                                                if (firstId === null || cur !== firstId) {
+                                                    lastId = cur;
+                                                    break;
+                                                }
+                                            } catch {}
+                                        }
+                                    }
 
-                                    // Sortuj ściśle po unikalnym Snowflake ID (BigInt) dopasowując się do naturalnego kierunku
+                                    const isAscending = firstId !== null && lastId !== null ? firstId < lastId : false;
+
+                                    action.messages.push(...toInject.map(ti => ti.rawMessage));
+
+                                    // 5. Sortuj ściśle po unikalnym Snowflake ID (BigInt) dopasowując się do naturalnego kierunku
                                     if (isAscending) {
-                                        // Rosnąco (najstarsze na początku, najnowsze na końcu)
                                         action.messages.sort((a: any, b: any) => {
                                             try {
                                                 const idA = BigInt(a.id);
@@ -675,7 +865,6 @@ export default definePlugin({
                                             }
                                         });
                                     } else {
-                                        // Malejąco (najnowsze na początku, najstarsze na końcu - standard API Discorda)
                                         action.messages.sort((a: any, b: any) => {
                                             try {
                                                 const idA = BigInt(a.id);
@@ -686,52 +875,48 @@ export default definePlugin({
                                             }
                                         });
                                     }
+
+                                    // 7. Dodaj log [ShadowLogs] dla każdej wstrzykniętej wiadomości: id, pozycja w tablicy po wstawieniu i powód wstrzyknięcia (inRange / reachesEnd / reachesStart)
+                                    for (const item of toInject) {
+                                        const pos = action.messages.findIndex((m: any) => String(m?.id) === String(item.id));
+                                        console.log(`[ShadowLogs] wstrzyknięta wiadomość: id=${item.id}, pozycja=${pos}, powód=${item.reason}`);
+                                    }
                                 }
                             }
+
+                            console.log(
+                                `[ShadowLogs] ${eventName}: channelId=${channelId}, dbReady=${isDbReady}, ` +
+                                `minId=${minId?.toString() ?? "none"}, maxId=${maxId?.toString() ?? "none"}, ` +
+                                `hasMoreBefore=${hasMoreBefore}, hasMoreAfter=${hasMoreAfter}, ` +
+                                `liczbaUsuniętychWBazie=${channelDeletedCount}, ` +
+                                `wstrzyknięte=${toInject.length}, odrzucone=${rejectedList.length}`
+                            );
+                            if (rejectedList.length > 0) {
+                                console.log(`[ShadowLogs] ${eventName} odrzucone z powodem:`, rejectedList);
+                            }
+                        } catch (e) {
+                            console.error("[ShadowLogs] Error in FluxDispatcher.dispatch interceptor:", e);
                         }
-                    } catch (e) {
-                        logger.error("Error splicing deleted messages into LOAD_MESSAGES_SUCCESS:", e);
+                    };
+
+                    if (!isDbReady) {
+                        Promise.race([
+                            dbReadyPromise,
+                            new Promise<void>(res => setTimeout(res, 1000))
+                        ]).then(() => {
+                            processAction();
+                            originalDispatch.call(FluxDispatcher, action);
+                        }).catch(err => {
+                            console.error("[ShadowLogs] Error waiting for dbReady in dispatch:", err);
+                            originalDispatch.call(FluxDispatcher, action);
+                        });
+                        return;
                     }
+
+                    processAction();
+                    return originalDispatch.apply(this, arguments);
                 }
                 return originalDispatch.apply(this, arguments);
-            };
-        }
-
-        // Safety fallback: Patch MessageStore.getMessages to inject deleted messages if missed
-        if (!originalGetMessages && MessageStore?.getMessages) {
-            originalGetMessages = MessageStore.getMessages;
-            MessageStore.getMessages = function (channelId: string) {
-                let res = originalGetMessages.apply(this, arguments);
-                if (res && channelId && typeof res.receiveMessage === "function" && inMemoryDeleted.has(channelId)) {
-                    const list = inMemoryDeleted.get(channelId);
-                    if (list && list.length > 0) {
-                        let changed = false;
-                        const sortedList = [...list].sort((a, b) => {
-                            try {
-                                const idA = BigInt(a.id);
-                                const idB = BigInt(b.id);
-                                return idA < idB ? -1 : idA > idB ? 1 : 0;
-                            } catch {
-                                return 0;
-                            }
-                        });
-                        for (const item of sortedList) {
-                            if (!res.has(item.id)) {
-                                try {
-                                    const msg = createDiscordMessage(item);
-                                    res = res.receiveMessage(msg);
-                                    changed = true;
-                                } catch (e) {
-                                    // ignore
-                                }
-                            }
-                        }
-                        if (changed) {
-                            MessageCache.commit(res);
-                        }
-                    }
-                }
-                return res;
             };
         }
 
@@ -741,81 +926,117 @@ export default definePlugin({
     stop() {
         if (this.boundOnMessageCreate) FluxDispatcher.unsubscribe("MESSAGE_CREATE", this.boundOnMessageCreate);
         if (this.boundOnMessageUpdate) FluxDispatcher.unsubscribe("MESSAGE_UPDATE", this.boundOnMessageUpdate);
-        if (this.boundOnChannelSelect) FluxDispatcher.unsubscribe("CHANNEL_SELECT", this.boundOnChannelSelect);
 
         if (originalDispatch) {
             FluxDispatcher.dispatch = originalDispatch;
             originalDispatch = null;
         }
 
-        if (originalGetMessages) {
-            MessageStore.getMessages = originalGetMessages;
-            originalGetMessages = null;
-        }
-
+        isDbReady = false;
         inMemoryDeleted.clear();
         logger.info("ShadowLogs stopped.");
     },
 
     boundOnMessageCreate: null as any,
     boundOnMessageUpdate: null as any,
-    boundOnChannelSelect: null as any,
 
     onMessageCreate(data: { message: any; channelId: string; }) {
-        // We only persist messages when they are deleted or edited, preventing unnecessary disk bloat
+        try {
+            const msg = data?.message;
+            if (!msg || !msg.id) return;
+
+            const reason = this.getIgnoreReason(msg);
+            if (reason) {
+                console.log(`[ShadowLogs] skipped ${msg.id} reason: ${reason}`);
+                return;
+            }
+
+            const chId = data.channelId || msg.channel_id;
+            const channel = ChannelStore.getChannel(chId);
+            const guildId = msg.guild_id || channel?.guild_id;
+
+            (async () => {
+                try {
+                    const rawItem = toRawStoredMessage(msg, chId, guildId);
+                    const saved = await saveNewMessage(rawItem);
+                    if (saved) {
+                        console.log(`[ShadowLogs] saved ${msg.id} channel ${chId} guild ${guildId || "DM"}`);
+                    }
+                } catch (err) {
+                    console.error("[ShadowLogs] Error in onMessageCreate async save:", err);
+                }
+            })();
+        } catch (e) {
+            console.error("[ShadowLogs] Error in onMessageCreate:", e);
+        }
     },
 
     onMessageUpdate(data: { message: any; }) {
         try {
             const msg = data.message;
             if (!msg || !msg.id || msg.content === undefined) return;
-            if (this.shouldIgnore(msg, true)) return;
+            const reason = this.getIgnoreReason(msg, true);
+            if (reason) {
+                console.log(`[ShadowLogs] skipped ${msg.id} reason: ${reason}`);
+                return;
+            }
 
             const oldMsg = MessageStore.getMessage(msg.channel_id, msg.id);
             if (oldMsg && oldMsg.content && oldMsg.content !== msg.content) {
-                addEdit(msg.id, oldMsg.content, Date.now()).catch(() => {});
+                (async () => {
+                    try {
+                        await addEdit(msg.id, oldMsg.content, Date.now(), oldMsg, msg.content);
+                    } catch (err) {
+                        console.error("[ShadowLogs] Error updating edit in onMessageUpdate:", err);
+                    }
+                })();
             }
         } catch (e) {
-            logger.error("Error in onMessageUpdate:", e);
+            console.error("[ShadowLogs] Error in onMessageUpdate:", e);
         }
     },
 
     renderEdits: ErrorBoundary.wrap(({ message: { id: messageId, channel_id: channelId } }: { message: Message }) => {
-        const message = useStateFromStores(
-            [MessageStore],
-            () => MessageStore.getMessage(channelId, messageId) as ShadowMessage,
-            null,
-            (oldMsg, newMsg) => oldMsg?.editHistory === newMsg?.editHistory && oldMsg?.deleted === newMsg?.deleted
-        );
+        try {
+            const message = useStateFromStores(
+                [MessageStore],
+                () => MessageStore.getMessage(channelId, messageId) as ShadowMessage,
+                null,
+                (oldMsg, newMsg) => oldMsg?.editHistory === newMsg?.editHistory && oldMsg?.deleted === newMsg?.deleted
+            );
 
-        if (!message) return null;
+            if (!message) return null;
 
-        return (
-            <>
-                {message.deleted && (
-                    <div style={{ marginBottom: "2px" }}>
-                        <span
-                            className="shadowlogs-deleted-badge"
-                            title={message.deletedAt ? "Deleted at " + new Date(message.deletedAt).toLocaleString() : "Message was deleted"}
-                        >
-                            {"[Deleted" + (message.deletedAt ? ": " + new Date(message.deletedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "") + "]"}
-                        </span>
-                    </div>
-                )}
-                {settings.store.logEdits && message.editHistory?.map((edit, idx) => (
-                    <div key={idx} className="shadowlogs-edited">
-                        {parseEditContent(edit.content, message)}
-                        <Timestamp
-                            timestamp={edit.timestamp}
-                            isEdited={true}
-                            isInline={false}
-                        >
-                            <span className={MessageClasses.edited}> (edited)</span>
-                        </Timestamp>
-                    </div>
-                ))}
-            </>
-        );
+            return (
+                <>
+                    {message.deleted && (
+                        <div style={{ marginBottom: "2px" }}>
+                            <span
+                                className="shadowlogs-deleted-badge"
+                                title={message.deletedAt ? "Deleted at " + new Date(message.deletedAt).toLocaleString() : "Message was deleted"}
+                            >
+                                {"[Deleted" + (message.deletedAt ? ": " + new Date(message.deletedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "") + "]"}
+                            </span>
+                        </div>
+                    )}
+                    {settings.store.logEdits && message.editHistory?.map((edit, idx) => (
+                        <div key={idx} className="shadowlogs-edited">
+                            {parseEditContent(edit.content, message)}
+                            <Timestamp
+                                timestamp={edit.timestamp}
+                                isEdited={true}
+                                isInline={false}
+                            >
+                                <span className={MessageClasses.edited}> (edited)</span>
+                            </Timestamp>
+                        </div>
+                    ))}
+                </>
+            );
+        } catch (e) {
+            console.error("[ShadowLogs] Error rendering edits in renderEdits:", e);
+            return null;
+        }
     }, { noop: true }),
 
     makeEdit(newMessage: any, oldMessage: any): any {
@@ -826,103 +1047,84 @@ export default definePlugin({
     },
 
     handleUpdateAttachments(newMessage: ShadowMessage): ShadowAttachment[] {
-        const oldMessage = MessageStore.getMessage(newMessage.channel_id, newMessage.id) as ShadowMessage | undefined;
-        if (!oldMessage || this.shouldIgnore(newMessage, true)) {
-            return newMessage.attachments || [];
+        try {
+            const oldMessage = MessageStore.getMessage(newMessage.channel_id, newMessage.id) as ShadowMessage | undefined;
+            if (!oldMessage || this.shouldIgnore(newMessage, true)) {
+                return newMessage.attachments || [];
+            }
+            if (!newMessage.attachments?.length) {
+                return (oldMessage.attachments || []).map((a: ShadowAttachment) => ({ ...a, deleted: true }));
+            }
+            return (oldMessage.attachments || [])
+                .map((oldAttachment: ShadowAttachment) =>
+                    newMessage.attachments?.find((a: any) => a.id === oldAttachment.id) ?? { ...oldAttachment, deleted: true }
+                )
+                .concat((newMessage.attachments || []).filter((a: any) => !(oldMessage.attachments || []).some((o: any) => o.id === a.id)));
+        } catch (e) {
+            console.error("[ShadowLogs] Error in handleUpdateAttachments:", e);
+            return newMessage?.attachments || [];
         }
-        if (!newMessage.attachments?.length) {
-            return (oldMessage.attachments || []).map((a: ShadowAttachment) => ({ ...a, deleted: true }));
-        }
-        return (oldMessage.attachments || [])
-            .map((oldAttachment: ShadowAttachment) =>
-                newMessage.attachments?.find((a: any) => a.id === oldAttachment.id) ?? { ...oldAttachment, deleted: true }
-            )
-            .concat((newMessage.attachments || []).filter((a: any) => !(oldMessage.attachments || []).some((o: any) => o.id === a.id)));
     },
 
     handleDelete(cache: any, data: { ids: string[]; id: string; channelId?: string; mlDeleted?: boolean }, isBulk: boolean) {
         try {
-            if (cache == null || (!isBulk && !cache.has(data.id))) return cache;
+            const targetIds = isBulk ? data.ids : [data.id];
+            if (!targetIds || targetIds.length === 0) return cache;
 
-            const mutate = (id: string) => {
-                const msg = cache.get(id);
-                if (!msg) return;
+            const now = Date.now();
+            const chId = data.channelId || SelectedChannelStore.getChannelId();
 
+            for (const id of targetIds) {
+                if (!id) continue;
+                const msg = cache?.get?.(id);
                 const EPHEMERAL = 64;
-                const shouldIgnore = data.mlDeleted || (msg.flags & EPHEMERAL) === EPHEMERAL || this.shouldIgnore(msg);
+                const shouldIgnore = data.mlDeleted || (msg && (msg.flags & EPHEMERAL) === EPHEMERAL) || (msg && this.shouldIgnore(msg));
 
                 if (shouldIgnore) {
-                    cache = cache.remove(id);
-                } else {
-                    const now = Date.now();
+                    if (cache?.has?.(id)) cache = cache.remove(id);
+                    continue;
+                }
+
+                if (cache?.has?.(id)) {
                     cache = cache.update(id, (m: any) =>
                         m
                             .set("deleted", true)
                             .set("deletedAt", now)
                             .set("attachments", (m.attachments || []).map((a: any) => ({ ...a, deleted: true })))
                     );
-
-                    const chId = msg.channel_id || data.channelId || SelectedChannelStore.getChannelId();
-                    const author = msg.author || {};
-                    const storedItem: StoredShadowMessage = {
-                        id: msg.id,
-                        channelId: chId,
-                        guildId: msg.guild_id || ChannelStore.getChannel(chId)?.guild_id,
-                        authorId: author.id ?? "",
-                        authorName: author.global_name || author.username || "User",
-                        authorAvatar: author.avatar,
-                        content: msg.content ?? "",
-                        // Zachowaj oryginalny timestamp wysłania (nie data usunięcia)
-                        timestamp: toEpoch(msg.timestamp, msg.id),
-                        deleted: true,
-                        deletedAt: now,
-                        attachments: msg.attachments?.map((a: any) => ({
-                            id: a.id,
-                            url: a.url,
-                            proxy_url: a.proxy_url,
-                            filename: a.filename,
-                            size: a.size,
-                            content_type: a.content_type,
-                            deleted: true,
-                        })),
-                        editHistory: msg.editHistory?.map((e: any) => ({
-                            timestamp: toEpoch(e.timestamp),
-                            content: e.content,
-                        })),
-                    };
-
-                    if (!inMemoryDeleted.has(chId)) {
-                        inMemoryDeleted.set(chId, []);
-                    }
-                    const list = inMemoryDeleted.get(chId)!;
-                    const existingIdx = list.findIndex(m => m.id === msg.id);
-                    if (existingIdx >= 0) {
-                        list[existingIdx] = storedItem;
-                    } else {
-                        list.push(storedItem);
-                    }
-
-                    // Save directly to persistent DataStore
-                    saveDeletedMessage(storedItem).catch(err => {
-                        logger.error("Failed to persist deleted message:", err);
-                    });
                 }
-            };
 
-            if (isBulk) {
-                data.ids.forEach(mutate);
-            } else {
-                mutate(data.id);
+                const fallbackMsg = msg;
+                (async () => {
+                    try {
+                        const updated = await markDeleted(id, now, fallbackMsg);
+                        if (updated) {
+                            const targetChId = updated.channelId || chId;
+                            if (!inMemoryDeleted.has(targetChId)) {
+                                inMemoryDeleted.set(targetChId, []);
+                            }
+                            const list = inMemoryDeleted.get(targetChId)!;
+                            const existingIdx = list.findIndex(m => m.id === id);
+                            if (existingIdx >= 0) {
+                                list[existingIdx] = updated;
+                            } else {
+                                list.push(updated);
+                            }
+                        }
+                    } catch (err) {
+                        console.error(`[ShadowLogs] Error marking deleted for message ${id}:`, err);
+                    }
+                })();
             }
         } catch (e) {
-            logger.error("Error during handleDelete:", e);
+            console.error("[ShadowLogs] Error during handleDelete:", e);
         }
         return cache;
     },
 
-    shouldIgnore(message: any, isEdit = false): boolean {
+    getIgnoreReason(message: any, isEdit = false): string | null {
         try {
-            if (!message) return false;
+            if (!message) return "No message object";
             const {
                 ignoreBots,
                 ignoreSelf,
@@ -935,48 +1137,54 @@ export default definePlugin({
                 logEdits,
             } = settings.store;
 
-            if (isEdit ? !logEdits : !logDeletes) return true;
+            if (isEdit && !logEdits) return "logEdits disabled";
+            if (!isEdit && !logDeletes) return "logDeletes disabled";
 
             const myId = UserStore.getCurrentUser()?.id;
-            if (ignoreSelf && message.author?.id === myId) return true;
-            if (ignoreBots && message.author?.bot) return true;
+            if (ignoreSelf && message.author?.id === myId) return "Ignore self";
+            if (ignoreBots && message.author?.bot) return "Bot user";
 
             const authorId = message.author?.id;
             if (authorId && blacklistedUsers) {
                 const uList = blacklistedUsers.split(",").map(s => s.trim()).filter(Boolean);
-                if (uList.includes(authorId)) return true;
+                if (uList.includes(authorId)) return "User blacklisted";
             }
 
-            const channelId = message.channel_id;
+            const channelId = message.channel_id || message.channelId;
             if (channelId && blacklistedChannels) {
                 const channel = ChannelStore.getChannel(channelId);
                 const cList = blacklistedChannels.split(",").map(s => s.trim()).filter(Boolean);
-                if (cList.includes(channelId)) return true;
-                if (channel?.parent_id && cList.includes(channel.parent_id)) return true;
+                if (cList.includes(channelId)) return "Channel blacklisted";
+                if (channel?.parent_id && cList.includes(channel.parent_id)) return "Parent channel blacklisted";
             }
 
-            const channel = ChannelStore.getChannel(message.channel_id);
-            const guildId = channel?.guild_id;
+            const channel = ChannelStore.getChannel(channelId);
+            const guildId = message.guild_id || message.guildId || channel?.guild_id;
             if (guildId) {
                 if (blacklistedGuilds) {
                     const bGuilds = blacklistedGuilds.split(",").map(s => s.trim()).filter(Boolean);
-                    if (bGuilds.includes(guildId)) return true;
+                    if (bGuilds.includes(guildId)) return "Guild blacklisted";
                 }
 
                 const wGuilds = whitelistedGuilds?.split(",").map(s => s.trim()).filter(Boolean) || [];
                 if (!wGuilds.includes(guildId)) {
                     const guild = GuildStore.getGuild(guildId);
-                    const memberCount = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId) ?? 0;
-                    if (memberCount > (memberThreshold || 500)) {
-                        return true;
+                    const count = (guild as any)?.memberCount ?? GuildMemberCountStore?.getMemberCount(guildId);
+                    const threshold = memberThreshold || 500;
+                    if (typeof count === "number" && count > 0 && count > threshold) {
+                        return `Member threshold exceeded (${count} > ${threshold})`;
                     }
                 }
             }
 
-            return false;
-        } catch (e) {
-            return false;
+            return null;
+        } catch {
+            return null;
         }
+    },
+
+    shouldIgnore(message: any, isEdit = false): boolean {
+        return this.getIgnoreReason(message, isEdit) !== null;
     },
 
     EditMarker({ message, className, children, ...props }: any) {
@@ -999,31 +1207,55 @@ export default definePlugin({
                 {
                     match: /(?<=MESSAGE_DELETE:function\((\i)\)\{)(?=let.{0,100}(\i\.\i)\.getOrCreate)/,
                     replace: `
-                        let cache = $2.getOrCreate($1.channelId);
-                        cache = $self.handleDelete(cache, $1, false);
-                        $2.commit(cache);
-                        return;
+                        try {
+                            console.log("[ShadowLogs] Patch MessageStore.MESSAGE_DELETE fired for messageId:", $1?.id, "channelId:", $1?.channelId);
+                            let cache = $2.getOrCreate($1.channelId);
+                            const countBefore = cache?._array?.length ?? cache?.length ?? 0;
+                            cache = $self.handleDelete(cache, $1, false);
+                            const countAfter = cache?._array?.length ?? cache?.length ?? 0;
+                            console.log("[ShadowLogs] Patch MessageStore.MESSAGE_DELETE finished. countBefore:", countBefore, "countAfter:", countAfter);
+                            $2.commit(cache);
+                            return;
+                        } catch (err) {
+                            console.error("[ShadowLogs] Error in patched MessageStore.MESSAGE_DELETE:", err);
+                        }
                     `,
                 },
                 {
                     match: /(?<=MESSAGE_DELETE_BULK:function\((\i)\){)(?=let.{0,100}(\i\.\i)\.getOrCreate)/,
                     replace: `
-                        let cache = $2.getOrCreate($1.channelId);
-                        cache = $self.handleDelete(cache, $1, true);
-                        $2.commit(cache);
-                        return;
+                        try {
+                            console.log("[ShadowLogs] Patch MessageStore.MESSAGE_DELETE_BULK fired for IDs count:", $1?.ids?.length, "channelId:", $1?.channelId);
+                            let cache = $2.getOrCreate($1.channelId);
+                            const countBefore = cache?._array?.length ?? cache?.length ?? 0;
+                            cache = $self.handleDelete(cache, $1, true);
+                            const countAfter = cache?._array?.length ?? cache?.length ?? 0;
+                            console.log("[ShadowLogs] Patch MessageStore.MESSAGE_DELETE_BULK finished. countBefore:", countBefore, "countAfter:", countAfter);
+                            $2.commit(cache);
+                            return;
+                        } catch (err) {
+                            console.error("[ShadowLogs] Error in patched MessageStore.MESSAGE_DELETE_BULK:", err);
+                        }
                     `,
                 },
                 {
                     match: /(MESSAGE_UPDATE:function\((\i)\).+?)\.update\((\i)/,
                     replace: `
                         $1
-                        .update($3, m =>
-                            (($2.message.flags & 64) === 64 || $self.shouldIgnore($2.message, true)) ? m :
-                            $2.message.edited_timestamp && $2.message.content !== m.content ?
-                                m.set('editHistory',[...(m.editHistory || []), $self.makeEdit($2.message, m)]) :
-                                m
-                        )
+                        .update($3, m => {
+                            try {
+                                if (!m) return m;
+                                if (($2.message.flags & 64) === 64 || $self.shouldIgnore($2.message, true)) return m;
+                                if ($2.message.edited_timestamp && $2.message.content !== m.content) {
+                                    console.log("[ShadowLogs] Patch MessageStore.MESSAGE_UPDATE edit recorded for messageId:", m.id);
+                                    return m.set('editHistory', [...(m.editHistory || []), $self.makeEdit($2.message, m)]);
+                                }
+                                return m;
+                            } catch (err) {
+                                console.error("[ShadowLogs] Error in patched MessageStore.MESSAGE_UPDATE updater:", err);
+                                return m;
+                            }
+                        })
                         .update($3
                     `,
                 },
@@ -1111,11 +1343,25 @@ export default definePlugin({
             replacement: [
                 {
                     match: /(?<=MESSAGE_DELETE:function\(\i\)\{)/,
-                    replace: "return;",
+                    replace: `
+                        try {
+                            console.log("[ShadowLogs] Patch ReferencedMessageStore.MESSAGE_DELETE intercepted for messageId:", arguments[0]?.id);
+                            return;
+                        } catch (err) {
+                            console.error("[ShadowLogs] Error in ReferencedMessageStore.MESSAGE_DELETE patch:", err);
+                        }
+                    `,
                 },
                 {
                     match: /(?<=MESSAGE_DELETE_BULK:function\(\i\)\{)/,
-                    replace: "return;",
+                    replace: `
+                        try {
+                            console.log("[ShadowLogs] Patch ReferencedMessageStore.MESSAGE_DELETE_BULK intercepted for IDs count:", arguments[0]?.ids?.length);
+                            return;
+                        } catch (err) {
+                            console.error("[ShadowLogs] Error in ReferencedMessageStore.MESSAGE_DELETE_BULK patch:", err);
+                        }
+                    `,
                 },
             ],
         },

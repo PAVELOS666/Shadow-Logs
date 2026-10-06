@@ -34,34 +34,112 @@ export function toEpoch(ts: any, snowflakeIdFallback?: string): number {
     return Date.now();
 }
 
+
+export function toRawStoredMessage(msg: any, channelId?: string, guildId?: string): StoredShadowMessage {
+    const chId = String(msg.channel_id || msg.channelId || channelId || "");
+    const gId = msg.guild_id || msg.guildId || guildId;
+    const author = msg.author || {};
+    const authorId = String(author.id || "");
+    const authorName = author.global_name || author.username || "User";
+    const authorAvatar = author.avatar;
+
+    return {
+        id: String(msg.id),
+        channel_id: chId,
+        guild_id: gId ? String(gId) : undefined,
+        channelId: chId,
+        guildId: gId ? String(gId) : undefined,
+        author: {
+            id: authorId,
+            username: author.username || "User",
+            avatar: authorAvatar,
+            global_name: author.global_name,
+            discriminator: author.discriminator || "0",
+            bot: !!author.bot,
+        },
+        authorId,
+        authorName,
+        authorAvatar,
+        content: String(msg.content ?? ""),
+        timestamp: toEpoch(msg.timestamp, msg.id),
+        deleted: false,
+        deletedAt: undefined,
+        editHistory: [],
+        attachments: (msg.attachments || []).map((a: any) => ({
+            id: String(a.id),
+            url: String(a.url),
+            proxy_url: a.proxy_url ? String(a.proxy_url) : undefined,
+            filename: String(a.filename || "file"),
+            size: typeof a.size === "number" ? a.size : 0,
+            content_type: a.content_type,
+            deleted: false,
+        })),
+        embeds: Array.isArray(msg.embeds) ? msg.embeds : [],
+        message_reference: msg.message_reference ? { ...msg.message_reference } : undefined,
+        sticker_items: Array.isArray(msg.sticker_items) ? msg.sticker_items : [],
+    };
+}
+
+export async function saveNewMessage(msg: StoredShadowMessage): Promise<boolean> {
+    try {
+        const existing = await DataStore.get<StoredShadowMessage>(msg.id, shadowStore);
+        if (existing) {
+            return false;
+        }
+        await DataStore.set(msg.id, msg, shadowStore);
+        return true;
+    } catch (e) {
+        console.error("[ShadowLogs] Error saving new message:", e);
+        return false;
+    }
+}
+
+export async function saveMessagesBatch(msgs: StoredShadowMessage[]): Promise<string[]> {
+    try {
+        if (!msgs || msgs.length === 0) return [];
+        const keys = msgs.map(m => m.id);
+        const existingList = await DataStore.getMany<StoredShadowMessage>(keys, shadowStore);
+        const existingSet = new Set<string>();
+        for (let i = 0; i < keys.length; i++) {
+            if (existingList[i]) {
+                existingSet.add(keys[i]);
+            }
+        }
+
+        const toPutEntries: [IDBValidKey, StoredShadowMessage][] = [];
+        const savedIds: string[] = [];
+        for (const msg of msgs) {
+            if (!existingSet.has(msg.id)) {
+                toPutEntries.push([msg.id, msg]);
+                savedIds.push(msg.id);
+            }
+        }
+
+        if (toPutEntries.length > 0) {
+            await DataStore.setMany(toPutEntries, shadowStore);
+        }
+        return savedIds;
+    } catch (e) {
+        console.error("[ShadowLogs] Error in saveMessagesBatch:", e);
+        return [];
+    }
+}
+
 export async function saveDeletedMessage(msg: StoredShadowMessage): Promise<void> {
     try {
-        const clean: StoredShadowMessage = {
-            id: String(msg.id),
-            channelId: String(msg.channelId),
-            guildId: msg.guildId ? String(msg.guildId) : undefined,
-            authorId: String(msg.authorId || ""),
-            authorName: msg.authorName || "User",
-            authorAvatar: msg.authorAvatar,
-            content: String(msg.content ?? ""),
-            timestamp: toEpoch(msg.timestamp, msg.id),
-            deleted: true,
-            deletedAt: toEpoch(msg.deletedAt || Date.now()),
-            attachments: (msg.attachments || []).map(a => ({
-                id: String(a.id),
-                url: String(a.url),
-                proxy_url: a.proxy_url ? String(a.proxy_url) : undefined,
-                filename: String(a.filename || "file"),
-                size: typeof a.size === "number" ? a.size : 0,
-                content_type: a.content_type,
-                deleted: true,
-            })),
-            editHistory: (msg.editHistory || []).map((e: any) => ({
+        const raw = toRawStoredMessage(msg);
+        raw.deleted = true;
+        raw.deletedAt = toEpoch(msg.deletedAt || Date.now());
+        if (raw.attachments) {
+            raw.attachments.forEach(a => (a.deleted = true));
+        }
+        if (msg.editHistory) {
+            raw.editHistory = msg.editHistory.map((e: any) => ({
                 timestamp: toEpoch(e.timestamp),
                 content: String(e.content ?? ""),
-            })),
-        };
-        await DataStore.set(clean.id, clean, shadowStore);
+            }));
+        }
+        await DataStore.set(raw.id, raw, shadowStore);
     } catch (e) {
         console.error("[ShadowLogs] Error saving deleted message:", e);
     }
@@ -78,7 +156,11 @@ export async function getMessage(id: string): Promise<StoredShadowMessage | unde
     }
 }
 
-export async function markDeleted(id: string, deletedAt = Date.now(), fallbackMsg?: any): Promise<void> {
+export async function markDeleted(
+    id: string,
+    deletedAt = Date.now(),
+    fallbackMsg?: any
+): Promise<StoredShadowMessage | null> {
     try {
         let existing = await DataStore.get<StoredShadowMessage>(id, shadowStore);
         if (existing) {
@@ -88,50 +170,50 @@ export async function markDeleted(id: string, deletedAt = Date.now(), fallbackMs
                 existing.attachments.forEach(a => (a.deleted = true));
             }
             await DataStore.set(id, existing, shadowStore);
+            return existing;
         } else if (fallbackMsg) {
-            const author = fallbackMsg.author || {};
-            const stored: StoredShadowMessage = {
-                id: String(fallbackMsg.id),
-                channelId: String(fallbackMsg.channel_id),
-                guildId: fallbackMsg.guild_id ? String(fallbackMsg.guild_id) : undefined,
-                authorId: String(author.id ?? ""),
-                authorName: author.global_name || author.username || "User",
-                authorAvatar: author.avatar,
-                content: String(fallbackMsg.content ?? ""),
-                timestamp: toEpoch(fallbackMsg.timestamp),
-                deleted: true,
-                deletedAt: toEpoch(deletedAt),
-                attachments: fallbackMsg.attachments?.map((a: any) => ({
-                    id: String(a.id),
-                    url: String(a.url),
-                    proxy_url: a.proxy_url ? String(a.proxy_url) : undefined,
-                    filename: String(a.filename || "file"),
-                    size: typeof a.size === "number" ? a.size : 0,
-                    content_type: a.content_type,
-                    deleted: true,
-                })),
-                editHistory: fallbackMsg.editHistory?.map((e: any) => ({
-                    timestamp: toEpoch(e.timestamp),
-                    content: String(e.content ?? ""),
-                })),
-            };
+            console.log(`[ShadowLogs] MESSAGE_DELETE: message ${id} not found in IndexedDB, using Discord cache fallback`);
+            const stored = toRawStoredMessage(fallbackMsg);
+            stored.deleted = true;
+            stored.deletedAt = toEpoch(deletedAt);
+            if (stored.attachments) {
+                stored.attachments.forEach(a => (a.deleted = true));
+            }
             await DataStore.set(id, stored, shadowStore);
+            return stored;
+        } else {
+            console.log(`[ShadowLogs] MESSAGE_DELETE: message ${id} not found in IndexedDB nor in fallback`);
+            return null;
         }
     } catch (e) {
         console.error("[ShadowLogs] Error marking deleted:", e);
+        return null;
     }
 }
 
-export async function addEdit(id: string, oldContent: string, timestamp: number): Promise<void> {
+export async function addEdit(
+    id: string,
+    oldContent: string,
+    timestamp: number,
+    fallbackMsg?: any,
+    newContent?: string
+): Promise<void> {
     try {
         let existing = await DataStore.get<StoredShadowMessage>(id, shadowStore);
+        if (!existing && fallbackMsg) {
+            existing = toRawStoredMessage(fallbackMsg);
+        }
         if (!existing) return;
+
         if (!existing.editHistory) existing.editHistory = [];
         const last = existing.editHistory[existing.editHistory.length - 1];
         if (!last || last.content !== oldContent) {
             existing.editHistory.push({ timestamp: toEpoch(timestamp), content: oldContent });
-            await DataStore.set(id, existing, shadowStore);
         }
+        if (newContent !== undefined) {
+            existing.content = String(newContent);
+        }
+        await DataStore.set(id, existing, shadowStore);
     } catch (e) {
         console.error("[ShadowLogs] Error adding edit:", e);
     }
@@ -273,16 +355,19 @@ export async function getStats(): Promise<DBStats> {
     try {
         const all = await DataStore.values<StoredShadowMessage>(shadowStore);
         const count = all ? all.length : 0;
+        const deletedCount = all ? all.filter(m => m && m.deleted).length : 0;
+        const editedCount = all ? all.filter(m => m && !m.deleted && (m.editHistory?.length || 0) > 0).length : 0;
         const json = JSON.stringify(all || []);
         const estimatedSizeBytes = json.length * 2;
         return {
             count,
-            deletedCount: count,
+            deletedCount,
+            editedCount,
             estimatedSizeBytes,
         };
     } catch (e) {
         console.error("[ShadowLogs] Error getting stats:", e);
-        return { count: 0, deletedCount: 0, estimatedSizeBytes: 0 };
+        return { count: 0, deletedCount: 0, editedCount: 0, estimatedSizeBytes: 0 };
     }
 }
 
